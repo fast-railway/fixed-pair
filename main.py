@@ -502,7 +502,6 @@ def extract_url_and_blocks(token: str) -> tuple:
     if url_end == -1:
         return token.strip(), [], False
     
-    # Strictly strip all invisible spacing characters that could corrupt URL parsing
     url = token[:url_end].strip().replace('\r', '').replace('\n', '').replace('\t', '')
     
     blocks = []
@@ -805,7 +804,19 @@ def resolve_specific_device(dev_str: str) -> tuple:
         else: os_name = "windows"
         
     allowed_browsers = DEVICE_TREE.get(cat, {}).get(os_name, ["chrome"])
-    chosen_browser = pick_browser_for_os(os_name, allowed_browsers, NATIVE_RATIO)
+    
+    # Check if a specific browser was explicitly requested inside the string
+    chosen_browser = None
+    if "edge" in dev_str: chosen_browser = "edge"
+    elif "firefox" in dev_str or "ff" in dev_str: chosen_browser = "firefox"
+    elif "opera" in dev_str: chosen_browser = "opera"
+    elif "samsung" in dev_str: chosen_browser = "samsung"
+    elif "safari" in dev_str and cat == "desktop": chosen_browser = "safari"
+    elif "chrome" in dev_str: chosen_browser = "chrome"
+    
+    if not chosen_browser:
+        chosen_browser = pick_browser_for_os(os_name, allowed_browsers, NATIVE_RATIO)
+        
     ua, label = get_ua_for_selection(cat, os_name, chosen_browser)
     return cat, ua, label
 
