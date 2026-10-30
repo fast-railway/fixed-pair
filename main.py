@@ -3,12 +3,12 @@ from datetime import datetime, timezone
 import os
 import random
 import re
+import string
 import sys
 import time
 import urllib.parse
 import urllib.request
 import urllib.error
-import string
 
 # ---------------------------------------------------------
 # Environment Parsers & Utilities (Case-Insensitive)
@@ -468,12 +468,8 @@ def sample_weighted_browser(high_list, mid_list, low_list):
 
 
 # ---------------------------------------------------------
-# Parsers for Links, Devices, & Overrides
+# Deterministic AST Parser for DEVICE_TYPE Hierarchy
 # ---------------------------------------------------------
-def generate_random_string(length: int) -> str:
-    pool = string.ascii_letters + string.digits
-    return "".join(random.choice(pool) for _ in range(length))
-
 def tokenize_balanced_blocks(s: str) -> list:
     tokens = []
     depth = 0
@@ -496,40 +492,6 @@ def tokenize_balanced_blocks(s: str) -> list:
     if last:
         tokens.append(last)
     return tokens
-
-def extract_url_and_blocks(token: str) -> tuple:
-    url_end = token.find('{')
-    if url_end == -1:
-        return token.strip(), [], False
-    
-    url = token[:url_end].strip().replace('\r', '').replace('\n', '').replace('\t', '')
-    
-    blocks = []
-    depth = 0
-    buf = []
-    syntax_error = False
-    
-    for ch in token[url_end:]:
-        if ch == '{':
-            if depth > 0: buf.append(ch)
-            depth += 1
-        elif ch == '}':
-            depth -= 1
-            if depth > 0: 
-                buf.append(ch)
-            elif depth == 0:
-                blocks.append("".join(buf).strip())
-                buf = []
-            else:
-                syntax_error = True
-        else:
-            if depth > 0:
-                buf.append(ch)
-                
-    if depth != 0:
-        syntax_error = True
-        
-    return url, blocks, syntax_error
 
 def parse_nested_device_spec(spec_str: str) -> dict:
     spec_str = spec_str.strip()
@@ -595,33 +557,6 @@ def parse_nested_device_spec(spec_str: str) -> dict:
 RAW_DEVICE_SPEC = get_env("DEVICE_TYPE", "desktop,mobile")
 DEVICE_TREE = parse_nested_device_spec(RAW_DEVICE_SPEC)
 NATIVE_RATIO = parse_native_ratio("BROWSER_NATIVE_RATIO", default_pct=80.0)
-
-
-# ---------------------------------------------------------
-# Dynamic Random Pairs Engine Config
-# ---------------------------------------------------------
-RAW_PAIRED_LINKS = get_env("PAIRED_LINKS")
-PAIRED_LINKS_DATA = []
-
-if RAW_PAIRED_LINKS:
-    tokens = tokenize_balanced_blocks(RAW_PAIRED_LINKS)
-    for token in tokens:
-        url, blocks, has_syntax_error = extract_url_and_blocks(token)
-        if not url: continue
-        
-        has_map = len(blocks) > 0
-        rand_tgt = blocks[0].strip() if len(blocks) > 0 else None
-        dev_map = blocks[1].strip() if len(blocks) > 1 else None
-        cty_map = blocks[2].strip() if len(blocks) > 2 else None
-
-        PAIRED_LINKS_DATA.append({
-            "url": url,
-            "random_target": rand_tgt,
-            "device": dev_map,
-            "country": cty_map,
-            "has_map": has_map,
-            "syntax_error": has_syntax_error
-        })
 
 
 # ---------------------------------------------------------
@@ -789,35 +724,26 @@ def resolve_cycle_ua(used_uas_in_cycle: set) -> tuple:
     return cat, ua, label
 
 
-def resolve_specific_device(dev_str: str) -> tuple:
-    dev_str = dev_str.lower().strip()
-        
-    if "mobile" in dev_str or "android" in dev_str or "ios" in dev_str or "iphone" in dev_str:
-        cat = "mobile"
-        if "android" in dev_str: os_name = "android"
-        elif "ios" in dev_str or "iphone" in dev_str: os_name = "ios"
-        else: os_name = random.choice(["android", "ios"])
-    else:
-        cat = "desktop"
-        if "mac" in dev_str: os_name = "mac"
-        elif "linux" in dev_str: os_name = "linux"
-        else: os_name = "windows"
-        
-    allowed_browsers = DEVICE_TREE.get(cat, {}).get(os_name, ["chrome"])
+def resolve_override_ua(used_uas_in_cycle: set, override_dev_str: str) -> tuple:
+    tree = parse_nested_device_spec(override_dev_str)
+    cats = list(tree.keys())
+    cat = random.choice(cats) if cats else "mobile"
+
+    sub_os_dict = tree.get(cat, {})
+    if not sub_os_dict:
+        sub_os_dict = {"android": ["chrome"]} if cat == "mobile" else {"windows": ["chrome"]}
+
+    chosen_os = random.choice(list(sub_os_dict.keys()))
+    allowed_browsers = sub_os_dict.get(chosen_os, ["chrome"])
+    chosen_browser = pick_browser_for_os(chosen_os, allowed_browsers, NATIVE_RATIO)
     
-    # Check if a specific browser was explicitly requested inside the string
-    chosen_browser = None
-    if "edge" in dev_str: chosen_browser = "edge"
-    elif "firefox" in dev_str or "ff" in dev_str: chosen_browser = "firefox"
-    elif "opera" in dev_str: chosen_browser = "opera"
-    elif "samsung" in dev_str: chosen_browser = "samsung"
-    elif "safari" in dev_str and cat == "desktop": chosen_browser = "safari"
-    elif "chrome" in dev_str: chosen_browser = "chrome"
-    
-    if not chosen_browser:
-        chosen_browser = pick_browser_for_os(os_name, allowed_browsers, NATIVE_RATIO)
-        
-    ua, label = get_ua_for_selection(cat, os_name, chosen_browser)
+    ua, label = "", ""
+    for _ in range(15):
+        ua, label = get_ua_for_selection(cat, chosen_os, chosen_browser)
+        if ua not in used_uas_in_cycle:
+            break
+
+    used_uas_in_cycle.add(ua)
     return cat, ua, label
 
 
@@ -993,19 +919,16 @@ def pick_datacenter_country(used_countries_in_cycle: set):
 
     return "DC", "US", "us"
 
-
-def resolve_specific_country(cty_str: str) -> tuple:
-    cty_str = cty_str.upper().strip()
-    if cty_str == "UK":
-        cty_str = "GB"  # Auto-correct common mistake
-        
-    if cty_str in DATACENTER_CODE_TO_NAME:
-        return f"OVR-{cty_str}", cty_str, cty_str.lower()
-    
-    # Fallback to random if not recognized or empty
-    pool = ALL_DATACENTER_NON_PREMIUM
-    c_up, c_low, _ = random.choice(pool)
-    return f"FALLBACK-{c_up}", c_up, c_low
+def pick_override_country(override_cc_str: str):
+    codes = [c.strip().upper() for c in override_cc_str.split(',') if c.strip()]
+    if not codes:
+        return "OVR-US", "US", "us"
+    c_up = random.choice(codes)
+    tier = "OVR"
+    if c_up in TIER_1_CODES: tier = "T1"
+    elif c_up in TIER_2_CODES: tier = "T2"
+    elif c_up in TIER_3_CODES: tier = "T3"
+    return f"{tier}-{c_up}", c_up, c_up.lower()
 
 
 # ---------------------------------------------------------
@@ -1057,9 +980,6 @@ class CycleLinkDispatcher:
             pool.append(("FULL", url, sl))
         for url, sl in self.explicit_short_links:
             pool.append(("SHORT_CUSTOM", url, sl))
-            
-        if not pool:
-            return tasks
 
         random.shuffle(pool)
 
@@ -1106,72 +1026,6 @@ class CycleLinkDispatcher:
             kind, raw_target, slug = random.choice(pool)
             tasks.append((raw_target, slug, kind))
 
-        return tasks
-
-
-class TaskManager:
-    def __init__(self, reg_dispatcher, paired_data, ratio_str):
-        r_reg, r_pair = 50.0, 50.0
-        if ratio_str:
-            parts = [p.strip() for p in ratio_str.split(",") if p.strip()]
-            if len(parts) >= 2:
-                try:
-                    r_reg, r_pair = float(parts[0]), float(parts[1])
-                except ValueError:
-                    pass
-        tot = r_reg + r_pair
-        self.weight_reg = r_reg / tot if tot > 0 else 0.5
-        
-        # Auto failover if one list is entirely empty
-        if not reg_dispatcher.full_links and paired_data:
-            self.weight_reg = 0.0
-        elif reg_dispatcher.full_links and not paired_data:
-            self.weight_reg = 1.0
-
-        self.reg_dispatcher = reg_dispatcher
-        self.paired_data = paired_data
-        self.weight_pair = 1.0 - self.weight_reg
-
-    def generate_tasks(self, count: int):
-        tasks = []
-        reg_batch = self.reg_dispatcher.generate_cycle_batch(count) if self.reg_dispatcher.full_links else []
-        reg_idx = 0
-        
-        for _ in range(count):
-            roll = random.random()
-            if roll < self.weight_reg and reg_idx < len(reg_batch):
-                url, slug, ltype = reg_batch[reg_idx]
-                tasks.append((url, slug, ltype, None, None))
-                reg_idx += 1
-            elif self.paired_data:
-                pair = random.choice(self.paired_data)
-                url = pair['url']
-                
-                # Replace ALL targeted strings with random chars of identical length
-                if pair['random_target']:
-                    tgts = [t.strip() for t in pair['random_target'].split(",") if t.strip()]
-                    for tgt in tgts:
-                        if tgt and tgt in url:
-                            new_str = generate_random_string(len(tgt))
-                            url = url.replace(tgt, new_str)
-                
-                # Pick ONE random device mapping from the comma-separated options
-                chosen_dev = None
-                if pair['device']:
-                    devs = [d.strip() for d in pair['device'].split(",") if d.strip()]
-                    if devs: chosen_dev = random.choice(devs)
-                
-                # Pick ONE random country mapping from the comma-separated options
-                chosen_cty = None
-                if pair['country']:
-                    ctys = [c.strip() for c in pair['country'].split(",") if c.strip()]
-                    if ctys: chosen_cty = random.choice(ctys)
-                    
-                tasks.append((url, "PAIRED", "PAIR-DIR", chosen_dev, chosen_cty))
-            elif reg_idx < len(reg_batch):
-                url, slug, ltype = reg_batch[reg_idx]
-                tasks.append((url, slug, ltype, None, None))
-                reg_idx += 1
         return tasks
 
 
@@ -1241,14 +1095,12 @@ CYCLE_GAP = parse_num("CYCLE_GAP", default=0.0)
 
 FOLLOW_REDIRECT = parse_bool("FOLLOW_REDIRECT", default=False)
 MATCH_IP_LANGUAGE = parse_bool("LANGUAGE_ACCORDING_TO_IP", default=False)
-
-WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 1.0, 4.0)
+WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 1, 3)
 GAP_MIN, GAP_MAX = parse_range("WORKER_GAP_RANGE", 8.0, 12.0)
 CYCLE_MIN, CYCLE_MAX = parse_range("CYCLE_INTERVAL_RANGE", 50.0, 70.0)
 POST_WAIT_MIN, POST_WAIT_MAX = parse_range("POST_RESPONSE_WAIT_RANGE", 5.0, 15.0)
 
-# Default to False for Render, Default to True for Residential
-BROWSER_RENDERING = parse_bool("BROWSER_RENDERING", default=False)
+BROWSER_RENDERING = get_env("BROWSER_RENDERING", "false").lower()
 RESIDENTIAL = parse_bool("RESIDENTIAL", default=True)
 
 DEFAULT_REFERRERS = [
@@ -1270,16 +1122,69 @@ INPUT_LINKS = parse_list("LINKS", parse_list("TARGET_URLS", parse_list("TARGET_S
 SHORT_TEMPLATE = get_env("SHORT_LINK_TEMPLATE")
 LINK_DISPATCHER = CycleLinkDispatcher(INPUT_LINKS, SHORT_TEMPLATE)
 
-RATIO_STR = get_env("LINK_PAIR_RATIO", "50,50")
-TASK_ENGINE = TaskManager(LINK_DISPATCHER, PAIRED_LINKS_DATA, RATIO_STR)
+# MAP LINKS Setup
+RAW_MAP_LINKS = get_env("MAP_LINKS", "")
+MAP_LINKS = [item.strip() for item in re.split(r",(?![^{]*\})", RAW_MAP_LINKS) if item.strip()]
+MAP_LINKS_RATIO = parse_native_ratio("MAP_LINKS_RATIO", default_pct=50.0)
 
-def calculate_credits(is_render: bool, is_residential: bool) -> int:
+def calculate_credits(render_flag: str, is_residential: bool) -> int:
+    is_render = render_flag == "true"
     if is_residential and is_render:
         return 25
     elif is_residential or is_render:
         return 10
     return 1
 
+# ---------------------------------------------------------
+# Dynamic Task Generator (Merging LINKS & MAP_LINKS)
+# ---------------------------------------------------------
+def generate_combined_tasks(worker_count: int):
+    tasks = []
+    has_std = bool(LINK_DISPATCHER.full_links or LINK_DISPATCHER.explicit_short_links)
+    has_map = bool(MAP_LINKS)
+    
+    num_map = 0
+    num_std = 0
+    
+    for _ in range(worker_count):
+        if has_map and has_std:
+            if random.random() < MAP_LINKS_RATIO:
+                num_map += 1
+            else:
+                num_std += 1
+        elif has_map:
+            num_map += 1
+        else:
+            num_std += 1
+            
+    std_tasks = LINK_DISPATCHER.generate_cycle_batch(num_std)
+    std_tasks = [(t[0], t[1], t[2], None, None) for t in std_tasks]
+    
+    map_tasks = []
+    for _ in range(num_map):
+        raw_map = random.choice(MAP_LINKS)
+        # Matches: url {rep} dev_string {cc_string} (all except url are optional)
+        match = re.match(r"^(?P<url>\S+)(?:\s+\{(?P<rep>.*?)\})?(?:\s+(?P<dev>(?:desktop|mobile)(?:\{.*?\})?))?(?:\s+\{(?P<cc>[a-zA-Z,]+)\})?$", raw_map, re.IGNORECASE)
+        
+        if match:
+            url_tmpl = match.group("url")
+            rep = match.group("rep")
+            dev = match.group("dev")
+            cc = match.group("cc")
+
+            if rep:
+                rand_str = ''.join(random.choices(string.ascii_letters + string.digits, k=len(rep)))
+                target = url_tmpl.replace(rep, rand_str)
+            else:
+                target = url_tmpl
+
+            map_tasks.append((target, "map_link", "MAP", dev, cc))
+        else:
+            map_tasks.append((raw_map.split()[0], "map_link", "MAP", None, None))
+            
+    combined = std_tasks + map_tasks
+    random.shuffle(combined)
+    return combined
 
 # ---------------------------------------------------------
 # Worker Bot Execution
@@ -1298,35 +1203,24 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
     params = {
         "api_key": key_obj.token,
         "device_type": selected_cat,
+        "render": BROWSER_RENDERING,
         "keep_headers": "true",
-        "session_number": str(rotation_seed),
-        "retry": "false"
+        "follow_redirect": "true" if FOLLOW_REDIRECT else "false",
+        "retry": "false",
+        "url": target_url
     }
-    
-    if FOLLOW_REDIRECT:
-        params["follow_redirect"] = "true"
-    else:
-        params["follow_redirect"] = "false"
-        
-    # Unconditionally inject rendering and premium flags if globally active
-    if BROWSER_RENDERING:
-        params["render"] = "true"
+
     if RESIDENTIAL:
         params["premium"] = "true"
+    else:
+        params["session_number"] = str(rotation_seed)
+
     if code_upper:
         params["country_code"] = code_upper.lower()
 
-    # FORCE CACHE BUST: Append random parameter to URL to prevent 1-credit cache refund
-    cache_buster = generate_random_string(12)
-    join_char = "&" if "?" in target_url else "?"
-    final_target = f"{target_url}{join_char}cb={cache_buster}"
+    url = f"http://api.scraperapi.com?{urllib.parse.urlencode(params)}"
     
-    # Safely append URL at the very end of the parameter string
-    encoded_target = urllib.parse.quote(final_target, safe='')
-    
-    query_string = "&".join([f"{k}={v}" for k, v in params.items()])
-    url = f"http://api.scraperapi.com?{query_string}&url={encoded_target}"
-    
+    # Determine language based on toggle and requested country
     if MATCH_IP_LANGUAGE and code_lower and code_upper:
         dynamic_lang = f"{code_lower}-{code_upper},{code_lower};q=0.9,en-US;q=0.8,en;q=0.5"
     else:
@@ -1354,39 +1248,30 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
 
     req = urllib.request.Request(url, headers=headers)
 
-    # For debugging output, let's format what is actually being sent to ScraperAPI (excluding API key/URL)
-    api_params_debug = "&".join([f"{k}={v}" for k, v in params.items() if k != "api_key"])
-
     try:
         with urllib.request.urlopen(req, timeout=65) as resp:
-            actual_credits = resp.headers.get("sa-credit-cost")
+            actual_credits = resp.headers.get("sa-credit-cost", str(expected_credits))
             
-            downgrade_warn = ""
-            if actual_credits and int(actual_credits) < expected_credits:
-                downgrade_warn = " [API DOWNGRADE]"
-                
-            cost_str = actual_credits if actual_credits else str(expected_credits)
-            
+            # Inspect proxy exit headers to detect silent upstream routing to US/NL/FR
             exit_country = (
                 resp.headers.get("sa-proxy-country") 
                 or resp.headers.get("sa-country") 
                 or resp.headers.get("x-scraperapi-country") 
                 or ""
             ).strip().upper()
-            
-            proxy_type = "RES-PREM" if RESIDENTIAL else "DC-STD"
 
+            # Strictly verify exit country if an explicit country was chosen
             if INC_COUNTRIES and code_upper and exit_country and exit_country != code_upper:
                 print(
-                    f"[Bot-{bot_id}/{total_bots}] [GEO REJECTED] [Requested: {code_upper} | Exit: {exit_country}] "
-                    f"Ignored to protect stats. [Credits: {cost_str} cost] [{key_obj.tag}]"
+                    f"[Bot-{bot_id}/{total_bots}] [GEO REJECTED] [Requested: {code_upper} | ScraperAPI returned: {exit_country}] "
+                    f"Traffic ignored to protect your stats. [Credits: ~{actual_credits}] [{key_obj.tag}]"
                 )
             else:
                 country_tag = exit_country if exit_country else code_upper
                 print(
-                    f"[Bot-{bot_id}/{total_bots}] [{tier_label}-{country_tag}] [{proxy_type}] [{selected_cat.upper()}:{os_label}] "
+                    f"[Bot-{bot_id}/{total_bots}] [{tier_label}-{country_tag}] [{selected_cat.upper()}:{os_label}] "
                     f"[{ltype} {slug}] [Target: {truncated_target}] [Ref: {ref_display}] "
-                    f"[Params: {api_params_debug}] [Credits: {cost_str} cost]{downgrade_warn} [{key_obj.tag}] -> HTTP {resp.status} OK"
+                    f"[Credits: ~{actual_credits} cost] [{key_obj.tag}] -> HTTP {resp.status} OK"
                 )
 
     except urllib.error.HTTPError as e:
@@ -1396,7 +1281,7 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
             raw_detail = "Could not read error body"
             
         if e.code in (401, 403):
-            reason_msg = f"HTTP {e.code} - ScraperAPI Error: {raw_detail}"
+            reason_msg = f"HTTP {e.code} - Actual ScraperAPI Error: {raw_detail}"
             pool.mark_dead(key_obj, reason_msg)
         elif e.code == 429:
             print(f"[Bot-{bot_id}] [{key_obj.tag}] [Target: {truncated_target}] [Credits: 0] [TRANSIENT] HTTP 429 Rate limit exceeded")
@@ -1421,73 +1306,38 @@ def main():
 
     print_datacenter_countries_table()
 
-    if not INPUT_LINKS and not PAIRED_LINKS_DATA:
+    if not INPUT_LINKS and not MAP_LINKS:
         print("\n" + "!" * 70)
         print(" [CONFIG ERROR] NO TARGET LINKS DETECTED!")
-        print(" Supply links via LINKS or PAIRED_LINKS variables.")
+        print(" Supply target links via LINKS or MAP_LINKS environment variables.")
         print("!" * 70 + "\n")
         sys.exit(1)
-
-    print("---------------- PAIRED LINKS CONFIGURATIONS -----")
-    if not PAIRED_LINKS_DATA:
-        print(" [INFO] No paired links detected. Standard links taking 100% route.")
-    else:
-        print(f" Detected {len(PAIRED_LINKS_DATA)} paired link(s).")
-        for idx, pair in enumerate(PAIRED_LINKS_DATA, 1):
-            if pair['syntax_error']:
-                print(f"  [{idx}] [SYNTAX MISTAKE] Unmatched brackets '{{}}' detected in map! Fix your URL formatting.")
-                print(f"         Offending URL: {truncate_url(pair['url'])}")
-                
-            if not pair['has_map']:
-                print(f"  [{idx}] [WARN] No map found. Defaults applied. Missing Map URL: {truncate_url(pair['url'])}")
-            else:
-                tgt_raw = pair['random_target']
-                if tgt_raw:
-                    tgts = [t.strip() for t in tgt_raw.split(",") if t.strip()]
-                    msgs = []
-                    for t in tgts:
-                        pos = pair['url'].find(t)
-                        if pos == -1:
-                            print(f"  [{idx}] [RED ALERT] Target string '{t}' NOT FOUND in URL! Replace will fail.")
-                        else:
-                            msgs.append(f"'{t}' (len {len(t)} @ pos {pos})")
-                    
-                    if msgs:
-                        tgt_msg = " & ".join(msgs)
-                        print(f"  [{idx}] [OK] Randomizing Targets: {tgt_msg}")
-                        print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto (Cycle Default)'} | Country Options: {pair['country'] or 'Auto (Cycle Default)'}")
-                else:
-                    print(f"  [{idx}] [OK] No random target specified.")
-                    print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto (Cycle Default)'} | Country Options: {pair['country'] or 'Auto (Cycle Default)'}")
 
     inc_display = ", ".join(sorted(list(INC_COUNTRIES))) if INC_COUNTRIES else "None (ALL allowed)"
     exc_display = ", ".join(sorted(list(EXC_COUNTRIES))) if EXC_COUNTRIES else "None"
     
-    print("---------------- GENERAL CONFIGURATION -----------")
-    print(f"Ratio Balancing         : {TASK_ENGINE.weight_reg * 100:.1f}% Standard / {TASK_ENGINE.weight_pair * 100:.1f}% Paired")
+    print("---------------- COUNTRY CONFIGURATION -----------")
     print(f"Included Countries      : {inc_display}")
     print(f"Excluded Countries      : {exc_display}")
     print(f"Working Datacenter Pool : {TOTAL_VALID} active (T1: {len(VALID_T1)} | T2: {len(VALID_T2)} | T3: {len(VALID_T3)})")
     print(f"Tier Selection Ratios   : T1={T1_RATIO:.1f}% | T2={T2_RATIO:.1f}% | T3={T3_RATIO:.1f}%")
     print(f"Route Change Fallback   : {ROUTE_CHANGE_ON_UNAVAILABLE} (Default: False)")
     print("--------------------------------------------------")
+    print(f"Standard Links Available: {len(LINK_DISPATCHER.full_links) + len(LINK_DISPATCHER.explicit_short_links)}")
+    print(f"Map Links Available     : {len(MAP_LINKS)} (50-50 Split: {int(MAP_LINKS_RATIO * 100)}%)")
     print(f"Follow Redirects        : {FOLLOW_REDIRECT}")
     print(f"Total Active Keys       : {len(pool.active_keys)}")
     print(f"Parallel Bots Enabled   : {PARALLELBOT}")
+    print(f"Browser Rendering       : {BROWSER_RENDERING}")
+    print(f"Residential Proxies     : {'ENABLED (premium=true)' if RESIDENTIAL else 'DISABLED (Standard DataCenter Free Credit)'}")
+    print(f"Est. Credits Per Hit    : ~{calculate_credits(BROWSER_RENDERING, RESIDENTIAL)} credits")
     print(f"Active Device Hierarchy : {DEVICE_TREE}")
     print(f"Native Browser Weight   : {int(NATIVE_RATIO * 100)}% Native / {int((1.0 - NATIVE_RATIO) * 100)}% Others")
     print(f"Post-Response Cooldown  : {POST_WAIT_MIN:.1f}s - {POST_WAIT_MAX:.1f}s")
     print(f"Worker Gap Interval     : {GAP_MIN:.1f}s - {GAP_MAX:.1f}s")
     print(f"Cycle Interval Range    : {CYCLE_MIN:.1f}s - {CYCLE_MAX:.1f}s")
+    print(f"Cycle Gap Duration      : {CYCLE_GAP}s")
     print(f"Dynamic IP Language     : {MATCH_IP_LANGUAGE}")
-    
-    print("---------------- SCRAPERAPI COST AUDIT -----------")
-    print(f"Residential Proxies     : {'ENABLED (premium=true)' if RESIDENTIAL else 'DISABLED'}")
-    print(f"Browser Rendering       : {'ENABLED (render=true)' if BROWSER_RENDERING else 'DISABLED'}")
-    print(f"Est. Target Cost        : {calculate_credits(BROWSER_RENDERING, RESIDENTIAL)} credits per request")
-    print("NOTE: If the bot logs output '[API DOWNGRADE]' despite Residential/Render being ENABLED,")
-    print("      it means your ScraperAPI plan restricts these premium features for the requested")
-    print("      country and silently fell back to a 1-credit standard proxy to process the request.")
     print("==================================================\n")
 
     cycle_num = 1
@@ -1507,24 +1357,32 @@ def main():
 
             print(f"\n--- [Cycle #{cycle_num}] Starting {worker_count} bots | Target: {target_cycle_time:.1f}s | Active Keys: {len(pool.active_keys)} ---")
 
-            tasks = TASK_ENGINE.generate_tasks(worker_count)
+            tasks = generate_combined_tasks(worker_count)
             
-            # Unique User Agents per cycle
+            bot_ua_assignments = []
+            bot_country_assignments = []
             used_uas_this_cycle = set()
-            bot_ua_assignments = [resolve_cycle_ua(used_uas_this_cycle) for _ in range(worker_count)]
-            
-            # Unique Countries per cycle
             used_countries_this_cycle = set()
-            bot_country_assignments = [pick_datacenter_country(used_countries_this_cycle) for _ in range(worker_count)]
+            
+            for _, _, _, override_dev, override_cc in tasks:
+                if override_dev:
+                    bot_ua_assignments.append(resolve_override_ua(used_uas_this_cycle, override_dev))
+                else:
+                    bot_ua_assignments.append(resolve_cycle_ua(used_uas_this_cycle))
+                    
+                if override_cc:
+                    bot_country_assignments.append(pick_override_country(override_cc))
+                else:
+                    bot_country_assignments.append(pick_datacenter_country(used_countries_this_cycle))
 
             if PARALLELBOT:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
                     futures = []
-                    for idx, (url, slug, ltype, dev_override, cty_override) in enumerate(tasks):
+                    for idx, (url, slug, ltype, _, _) in enumerate(tasks):
                         stagger = idx * random.uniform(GAP_MIN, GAP_MAX)
                         
-                        cat, ua_str, ua_label = resolve_specific_device(dev_override) if dev_override else bot_ua_assignments[idx]
-                        tier_label, code_upper, code_lower = resolve_specific_country(cty_override) if cty_override else bot_country_assignments[idx]
+                        cat, ua_str, ua_label = bot_ua_assignments[idx]
+                        tier_label, code_upper, code_lower = bot_country_assignments[idx]
                         
                         futures.append(
                             executor.submit(
@@ -1534,11 +1392,11 @@ def main():
                         )
                     concurrent.futures.wait(futures)
             else:
-                for idx, (url, slug, ltype, dev_override, cty_override) in enumerate(tasks):
+                for idx, (url, slug, ltype, _, _) in enumerate(tasks):
                     stagger = idx * random.uniform(GAP_MIN, GAP_MAX)
                     
-                    cat, ua_str, ua_label = resolve_specific_device(dev_override) if dev_override else bot_ua_assignments[idx]
-                    tier_label, code_upper, code_lower = resolve_specific_country(cty_override) if cty_override else bot_country_assignments[idx]
+                    cat, ua_str, ua_label = bot_ua_assignments[idx]
+                    tier_label, code_upper, code_lower = bot_country_assignments[idx]
                     
                     execute_bot(idx + 1, worker_count, url, slug, ltype, stagger, 
                                 cat, ua_str, ua_label, tier_label, code_upper, code_lower)
