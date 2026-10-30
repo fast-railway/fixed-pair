@@ -502,7 +502,9 @@ def extract_url_and_blocks(token: str) -> tuple:
     if url_end == -1:
         return token.strip(), [], False
     
-    url = token[:url_end].strip()
+    # Strictly strip all invisible spacing characters that could corrupt URL parsing
+    url = token[:url_end].strip().replace('\r', '').replace('\n', '').replace('\t', '')
+    
     blocks = []
     depth = 0
     buf = []
@@ -1277,13 +1279,21 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
     key_obj = pool.get_key()
     if not key_obj:
         return
+        
+    # [NEW] CACHE-BUSTER: Append a random tag to the end of EVERY URL.
+    # This completely blocks ScraperAPI from reading cached Windows endpoints and forces
+    # them to route through a real residential proxy connection (consuming the full 10 credits).
+    cache_bypass_key = f"nocache_{random.randint(10000, 99999)}"
+    cache_bypass_val = generate_random_string(8)
+    if "?" in target_url:
+        target_url = f"{target_url}&{cache_bypass_key}={cache_bypass_val}"
+    else:
+        target_url = f"{target_url}?{cache_bypass_key}={cache_bypass_val}"
 
     expected_credits = calculate_credits(BROWSER_RENDERING, RESIDENTIAL)
     truncated_target = truncate_url(target_url, head_len=18, tail_len=14)
     rotation_seed = random.randint(1000000, 9999999)
 
-    # Note: 'url' must be appended LAST in the params dictionary to prevent 
-    # ScraperAPI from absorbing premium tags due to a known API query bug.
     params = {
         "api_key": key_obj.token,
         "device_type": selected_cat,
@@ -1297,7 +1307,7 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
     else:
         params["follow_redirect"] = "false"
         
-    # Inject rendering and premium flags before URL
+    # Unconditionally inject rendering and premium flags if globally active
     if BROWSER_RENDERING:
         params["render"] = "true"
     if RESIDENTIAL:
@@ -1305,10 +1315,12 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
     if code_upper:
         params["country_code"] = code_upper.lower()
 
-    # Safely append url at the very end of the URL request string block
-    params["url"] = target_url
+    # Apply the target URL manually to the very end of the ScraperAPI query
+    encoded_target = urllib.parse.quote(target_url, safe='')
+    query_parts = [f"{k}={v}" for k, v in params.items()]
+    query_parts.append(f"url={encoded_target}")
 
-    url = f"http://api.scraperapi.com?{urllib.parse.urlencode(params)}"
+    url = f"http://api.scraperapi.com?{'&'.join(query_parts)}"
     
     if MATCH_IP_LANGUAGE and code_lower and code_upper:
         dynamic_lang = f"{code_lower}-{code_upper},{code_lower};q=0.9,en-US;q=0.8,en;q=0.5"
@@ -1337,8 +1349,7 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
 
     req = urllib.request.Request(url, headers=headers)
 
-    # For debugging output, let's format what is actually being sent to ScraperAPI (excluding URL/API key)
-    api_params_debug = "&".join([f"{k}={v}" for k, v in params.items() if k not in ["api_key", "url"]])
+    api_params_debug = "&".join([f"{k}={v}" for k, v in params.items() if k not in ["api_key"]])
 
     try:
         with urllib.request.urlopen(req, timeout=65) as resp:
@@ -1369,183 +1380,4 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
                 print(
                     f"[Bot-{bot_id}/{total_bots}] [{tier_label}-{country_tag}] [{proxy_type}] [{selected_cat.upper()}:{os_label}] "
                     f"[{ltype} {slug}] [Target: {truncated_target}] [Ref: {ref_display}] "
-                    f"[Params: {api_params_debug}] [Credits: {cost_str} cost]{downgrade_warn} [{key_obj.tag}] -> HTTP {resp.status} OK"
-                )
-
-    except urllib.error.HTTPError as e:
-        try:
-            raw_detail = e.read().decode("utf-8", errors="ignore").strip()
-        except Exception:
-            raw_detail = "Could not read error body"
-            
-        if e.code in (401, 403):
-            reason_msg = f"HTTP {e.code} - ScraperAPI Error: {raw_detail}"
-            pool.mark_dead(key_obj, reason_msg)
-        elif e.code == 429:
-            print(f"[Bot-{bot_id}] [{key_obj.tag}] [Target: {truncated_target}] [Credits: 0] [TRANSIENT] HTTP 429 Rate limit exceeded")
-        else:
-            print(f"[Bot-{bot_id}] [{key_obj.tag}] [Target: {truncated_target}] [Credits: 0] [WARN] HTTP {e.code}: {raw_detail}")
-
-    except Exception as ex:
-        print(f"[Bot-{bot_id}] [{key_obj.tag}] [Target: {truncated_target}] [Credits: 0] [CLIENT ERROR]: {str(ex)}")
-
-    post_wait = random.uniform(POST_WAIT_MIN, POST_WAIT_MAX)
-    gap_wait = random.uniform(GAP_MIN, GAP_MAX)
-    time.sleep(post_wait + gap_wait)
-
-
-# ---------------------------------------------------------
-# Main Execution Loop
-# ---------------------------------------------------------
-def main():
-    print("==================================================")
-    print("      UNIVERSAL SCRAPER ENGINE RUNTIME            ")
-    print("==================================================")
-
-    print_datacenter_countries_table()
-
-    if not INPUT_LINKS and not PAIRED_LINKS_DATA:
-        print("\n" + "!" * 70)
-        print(" [CONFIG ERROR] NO TARGET LINKS DETECTED!")
-        print(" Supply links via LINKS or PAIRED_LINKS variables.")
-        print("!" * 70 + "\n")
-        sys.exit(1)
-
-    print("---------------- PAIRED LINKS CONFIGURATIONS -----")
-    if not PAIRED_LINKS_DATA:
-        print(" [INFO] No paired links detected. Standard links taking 100% route.")
-    else:
-        print(f" Detected {len(PAIRED_LINKS_DATA)} paired link(s).")
-        for idx, pair in enumerate(PAIRED_LINKS_DATA, 1):
-            if pair['syntax_error']:
-                print(f"  [{idx}] [SYNTAX MISTAKE] Unmatched brackets '{{}}' detected in map! Fix your URL formatting.")
-                print(f"         Offending URL: {truncate_url(pair['url'])}")
-                
-            if not pair['has_map']:
-                print(f"  [{idx}] [WARN] No map found. Defaults applied. Missing Map URL: {truncate_url(pair['url'])}")
-            else:
-                tgt_raw = pair['random_target']
-                if tgt_raw:
-                    tgts = [t.strip() for t in tgt_raw.split(",") if t.strip()]
-                    msgs = []
-                    for t in tgts:
-                        pos = pair['url'].find(t)
-                        if pos == -1:
-                            print(f"  [{idx}] [RED ALERT] Target string '{t}' NOT FOUND in URL! Replace will fail.")
-                        else:
-                            msgs.append(f"'{t}' (len {len(t)} @ pos {pos})")
-                    
-                    if msgs:
-                        tgt_msg = " & ".join(msgs)
-                        print(f"  [{idx}] [OK] Randomizing Targets: {tgt_msg}")
-                        print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto (Cycle Default)'} | Country Options: {pair['country'] or 'Auto (Cycle Default)'}")
-                else:
-                    print(f"  [{idx}] [OK] No random target specified.")
-                    print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto (Cycle Default)'} | Country Options: {pair['country'] or 'Auto (Cycle Default)'}")
-
-    inc_display = ", ".join(sorted(list(INC_COUNTRIES))) if INC_COUNTRIES else "None (ALL allowed)"
-    exc_display = ", ".join(sorted(list(EXC_COUNTRIES))) if EXC_COUNTRIES else "None"
-    
-    print("---------------- GENERAL CONFIGURATION -----------")
-    print(f"Ratio Balancing         : {TASK_ENGINE.weight_reg * 100:.1f}% Standard / {TASK_ENGINE.weight_pair * 100:.1f}% Paired")
-    print(f"Included Countries      : {inc_display}")
-    print(f"Excluded Countries      : {exc_display}")
-    print(f"Working Datacenter Pool : {TOTAL_VALID} active (T1: {len(VALID_T1)} | T2: {len(VALID_T2)} | T3: {len(VALID_T3)})")
-    print(f"Tier Selection Ratios   : T1={T1_RATIO:.1f}% | T2={T2_RATIO:.1f}% | T3={T3_RATIO:.1f}%")
-    print(f"Route Change Fallback   : {ROUTE_CHANGE_ON_UNAVAILABLE} (Default: False)")
-    print("--------------------------------------------------")
-    print(f"Follow Redirects        : {FOLLOW_REDIRECT}")
-    print(f"Total Active Keys       : {len(pool.active_keys)}")
-    print(f"Parallel Bots Enabled   : {PARALLELBOT}")
-    print(f"Active Device Hierarchy : {DEVICE_TREE}")
-    print(f"Native Browser Weight   : {int(NATIVE_RATIO * 100)}% Native / {int((1.0 - NATIVE_RATIO) * 100)}% Others")
-    print(f"Post-Response Cooldown  : {POST_WAIT_MIN:.1f}s - {POST_WAIT_MAX:.1f}s")
-    print(f"Worker Gap Interval     : {GAP_MIN:.1f}s - {GAP_MAX:.1f}s")
-    print(f"Cycle Interval Range    : {CYCLE_MIN:.1f}s - {CYCLE_MAX:.1f}s")
-    print(f"Dynamic IP Language     : {MATCH_IP_LANGUAGE}")
-    
-    print("---------------- SCRAPERAPI COST AUDIT -----------")
-    print(f"Residential Proxies     : {'ENABLED (premium=true)' if RESIDENTIAL else 'DISABLED'}")
-    print(f"Browser Rendering       : {'ENABLED (render=true)' if BROWSER_RENDERING else 'DISABLED'}")
-    print(f"Est. Target Cost        : {calculate_credits(BROWSER_RENDERING, RESIDENTIAL)} credits per request")
-    print("NOTE: If the bot logs output '[API DOWNGRADE]' despite Residential/Render being ENABLED,")
-    print("      it means your ScraperAPI plan restricts these premium features for the requested")
-    print("      country and silently fell back to a 1-credit standard proxy to process the request.")
-    print("==================================================\n")
-
-    cycle_num = 1
-
-    try:
-        while True:
-            if not pool.active_keys:
-                print("\n" + "!" * 70)
-                print(" [SHUTDOWN] ALL CONFIGURED KEYS HAVE EXHAUSTED CREDITS.")
-                pool.print_pinned_status()
-                print("!" * 70 + "\n")
-                sys.exit(0)
-
-            cycle_start = time.time()
-            worker_count = random.randint(int(WORKER_MIN), int(WORKER_MAX))
-            target_cycle_time = random.uniform(CYCLE_MIN, CYCLE_MAX)
-
-            print(f"\n--- [Cycle #{cycle_num}] Starting {worker_count} bots | Target: {target_cycle_time:.1f}s | Active Keys: {len(pool.active_keys)} ---")
-
-            tasks = TASK_ENGINE.generate_tasks(worker_count)
-            
-            # Unique User Agents per cycle
-            used_uas_this_cycle = set()
-            bot_ua_assignments = [resolve_cycle_ua(used_uas_this_cycle) for _ in range(worker_count)]
-            
-            # Unique Countries per cycle
-            used_countries_this_cycle = set()
-            bot_country_assignments = [pick_datacenter_country(used_countries_this_cycle) for _ in range(worker_count)]
-
-            if PARALLELBOT:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    futures = []
-                    for idx, (url, slug, ltype, dev_override, cty_override) in enumerate(tasks):
-                        stagger = idx * random.uniform(GAP_MIN, GAP_MAX)
-                        
-                        cat, ua_str, ua_label = resolve_specific_device(dev_override) if dev_override else bot_ua_assignments[idx]
-                        tier_label, code_upper, code_lower = resolve_specific_country(cty_override) if cty_override else bot_country_assignments[idx]
-                        
-                        futures.append(
-                            executor.submit(
-                                execute_bot, idx + 1, worker_count, url, slug, ltype, stagger, 
-                                cat, ua_str, ua_label, tier_label, code_upper, code_lower
-                            )
-                        )
-                    concurrent.futures.wait(futures)
-            else:
-                for idx, (url, slug, ltype, dev_override, cty_override) in enumerate(tasks):
-                    stagger = idx * random.uniform(GAP_MIN, GAP_MAX)
-                    
-                    cat, ua_str, ua_label = resolve_specific_device(dev_override) if dev_override else bot_ua_assignments[idx]
-                    tier_label, code_upper, code_lower = resolve_specific_country(cty_override) if cty_override else bot_country_assignments[idx]
-                    
-                    execute_bot(idx + 1, worker_count, url, slug, ltype, stagger, 
-                                cat, ua_str, ua_label, tier_label, code_upper, code_lower)
-
-            elapsed = time.time() - cycle_start
-            wait_time = target_cycle_time - elapsed
-
-            pool.print_pinned_status()
-
-            if wait_time > 0 and pool.active_keys:
-                print(f"--- [Cycle #{cycle_num} Complete] Elapsed: {elapsed:.1f}s | Pausing {wait_time:.1f}s before next round ---")
-                time.sleep(wait_time)
-            elif pool.active_keys:
-                print(f"--- [Cycle #{cycle_num} Complete] Elapsed: {elapsed:.1f}s | Starting next round immediately ---")
-
-            if CYCLE_GAP > 0 and pool.active_keys:
-                print(f"--- Applying explicit Cycle Gap of {CYCLE_GAP}s ---")
-                time.sleep(CYCLE_GAP)
-
-            cycle_num += 1
-
-    except KeyboardInterrupt:
-        print("\nShutdown signal caught. Exiting.")
-        sys.exit(0)
-
-if __name__ == "__main__":
-    main()
+                    f"[Params: {api_params_debug}] [Credits: {cost_str} cost]{downgrade_warn} [{key_obj.tag}] -> HTTP {
