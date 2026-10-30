@@ -1234,6 +1234,7 @@ GAP_MIN, GAP_MAX = parse_range("WORKER_GAP_RANGE", 8.0, 12.0)
 CYCLE_MIN, CYCLE_MAX = parse_range("CYCLE_INTERVAL_RANGE", 50.0, 70.0)
 POST_WAIT_MIN, POST_WAIT_MAX = parse_range("POST_RESPONSE_WAIT_RANGE", 5.0, 15.0)
 
+# Default to False for Render, Default to True for Residential
 BROWSER_RENDERING = parse_bool("BROWSER_RENDERING", default=False)
 RESIDENTIAL = parse_bool("RESIDENTIAL", default=True)
 
@@ -1281,9 +1282,10 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
     truncated_target = truncate_url(target_url, head_len=18, tail_len=14)
     rotation_seed = random.randint(1000000, 9999999)
 
+    # Note: 'url' must be appended LAST in the params dictionary to prevent 
+    # ScraperAPI from absorbing premium tags due to a known API query bug.
     params = {
         "api_key": key_obj.token,
-        "url": target_url,
         "device_type": selected_cat,
         "keep_headers": "true",
         "session_number": str(rotation_seed),
@@ -1295,13 +1297,16 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
     else:
         params["follow_redirect"] = "false"
         
-    # Unconditionally inject rendering and premium flags if globally active
+    # Inject rendering and premium flags before URL
     if BROWSER_RENDERING:
         params["render"] = "true"
     if RESIDENTIAL:
         params["premium"] = "true"
     if code_upper:
         params["country_code"] = code_upper.lower()
+
+    # Safely append url at the very end of the URL request string block
+    params["url"] = target_url
 
     url = f"http://api.scraperapi.com?{urllib.parse.urlencode(params)}"
     
@@ -1417,7 +1422,7 @@ def main():
                 print(f"         Offending URL: {truncate_url(pair['url'])}")
                 
             if not pair['has_map']:
-                print(f"  [{idx}] [WARN] No map found. Defaults applied (Desktop). Missing Map URL: {truncate_url(pair['url'])}")
+                print(f"  [{idx}] [WARN] No map found. Defaults applied. Missing Map URL: {truncate_url(pair['url'])}")
             else:
                 tgt_raw = pair['random_target']
                 if tgt_raw:
