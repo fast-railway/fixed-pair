@@ -609,12 +609,9 @@ if RAW_PAIRED_LINKS:
         if not url: continue
         
         has_map = len(blocks) > 0
-        rand_tgt = blocks[0] if len(blocks) > 0 else ""
-        dev_map = blocks[1] if len(blocks) > 1 else ""
-        cty_map = blocks[2] if len(blocks) > 2 else ""
-
-        if not has_map:
-            dev_map = "desktop"
+        rand_tgt = blocks[0].strip() if len(blocks) > 0 else None
+        dev_map = blocks[1].strip() if len(blocks) > 1 else None
+        cty_map = blocks[2].strip() if len(blocks) > 2 else None
 
         PAIRED_LINKS_DATA.append({
             "url": url,
@@ -793,8 +790,6 @@ def resolve_cycle_ua(used_uas_in_cycle: set) -> tuple:
 
 def resolve_specific_device(dev_str: str) -> tuple:
     dev_str = dev_str.lower().strip()
-    if not dev_str:
-        return resolve_cycle_ua(set())
         
     if "mobile" in dev_str or "android" in dev_str or "ios" in dev_str or "iphone" in dev_str:
         cat = "mobile"
@@ -1138,22 +1133,22 @@ class TaskManager:
                 
                 # Replace ALL targeted strings with random chars of identical length
                 if pair['random_target']:
-                    tgts = tokenize_balanced_blocks(pair['random_target'])
+                    tgts = [t.strip() for t in pair['random_target'].split(",") if t.strip()]
                     for tgt in tgts:
                         if tgt and tgt in url:
                             new_str = generate_random_string(len(tgt))
                             url = url.replace(tgt, new_str)
                 
                 # Pick ONE random device mapping from the comma-separated options
-                chosen_dev = ""
+                chosen_dev = None
                 if pair['device']:
-                    devs = tokenize_balanced_blocks(pair['device'])
+                    devs = [d.strip() for d in pair['device'].split(",") if d.strip()]
                     if devs: chosen_dev = random.choice(devs)
                 
                 # Pick ONE random country mapping from the comma-separated options
-                chosen_cty = ""
+                chosen_cty = None
                 if pair['country']:
-                    ctys = tokenize_balanced_blocks(pair['country'])
+                    ctys = [c.strip() for c in pair['country'].split(",") if c.strip()]
                     if ctys: chosen_cty = random.choice(ctys)
                     
                 tasks.append((url, "PAIRED", "PAIR-DIR", chosen_dev, chosen_cty))
@@ -1235,6 +1230,7 @@ GAP_MIN, GAP_MAX = parse_range("WORKER_GAP_RANGE", 8.0, 12.0)
 CYCLE_MIN, CYCLE_MAX = parse_range("CYCLE_INTERVAL_RANGE", 50.0, 70.0)
 POST_WAIT_MIN, POST_WAIT_MAX = parse_range("POST_RESPONSE_WAIT_RANGE", 5.0, 15.0)
 
+# Default to False for Render, Default to True for Residential
 BROWSER_RENDERING = parse_bool("BROWSER_RENDERING", default=False)
 RESIDENTIAL = parse_bool("RESIDENTIAL", default=True)
 
@@ -1285,21 +1281,24 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
     params = {
         "api_key": key_obj.token,
         "device_type": selected_cat,
-        "render": "true" if BROWSER_RENDERING else "false",
         "keep_headers": "true",
         "session_number": str(rotation_seed),
         "follow_redirect": "true" if FOLLOW_REDIRECT else "false",
         "retry": "false",
         "url": target_url
     }
+    
+    # Strictly bind Premium and Render attributes to URL if global toggles are True
+    if BROWSER_RENDERING:
+        params["render"] = "true"
     if code_upper:
         params["country_code"] = code_upper.lower()
-    
     if RESIDENTIAL:
         params["premium"] = "true"
 
     url = f"http://api.scraperapi.com?{urllib.parse.urlencode(params)}"
     
+    # Determine language based on toggle and requested country
     if MATCH_IP_LANGUAGE and code_lower and code_upper:
         dynamic_lang = f"{code_lower}-{code_upper},{code_lower};q=0.9,en-US;q=0.8,en;q=0.5"
     else:
@@ -1329,7 +1328,14 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
 
     try:
         with urllib.request.urlopen(req, timeout=65) as resp:
-            actual_credits = resp.headers.get("sa-credit-cost", str(expected_credits))
+            actual_credits = resp.headers.get("sa-credit-cost")
+            
+            # API Downgrade Detection
+            downgrade_warn = ""
+            if actual_credits and int(actual_credits) < expected_credits:
+                downgrade_warn = " [API DOWNGRADE: ScraperAPI ignored Premium request!]"
+                
+            cost_str = actual_credits if actual_credits else str(expected_credits)
             
             exit_country = (
                 resp.headers.get("sa-proxy-country") 
@@ -1343,14 +1349,14 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
             if INC_COUNTRIES and code_upper and exit_country and exit_country != code_upper:
                 print(
                     f"[Bot-{bot_id}/{total_bots}] [GEO REJECTED] [Requested: {code_upper} | Exit: {exit_country}] "
-                    f"Ignored to protect stats. [Credits: {actual_credits} cost] [{key_obj.tag}]"
+                    f"Ignored to protect stats. [Credits: {cost_str} cost] [{key_obj.tag}]"
                 )
             else:
                 country_tag = exit_country if exit_country else code_upper
                 print(
                     f"[Bot-{bot_id}/{total_bots}] [{tier_label}-{country_tag}] [{proxy_type}] [{selected_cat.upper()}:{os_label}] "
                     f"[{ltype} {slug}] [Target: {truncated_target}] [Ref: {ref_display}] "
-                    f"[Credits: {actual_credits} cost] [{key_obj.tag}] -> HTTP {resp.status} OK"
+                    f"[Credits: {cost_str} cost]{downgrade_warn} [{key_obj.tag}] -> HTTP {resp.status} OK"
                 )
 
     except urllib.error.HTTPError as e:
@@ -1407,7 +1413,7 @@ def main():
             else:
                 tgt_raw = pair['random_target']
                 if tgt_raw:
-                    tgts = tokenize_balanced_blocks(tgt_raw)
+                    tgts = [t.strip() for t in tgt_raw.split(",") if t.strip()]
                     msgs = []
                     for t in tgts:
                         pos = pair['url'].find(t)
@@ -1417,12 +1423,12 @@ def main():
                             msgs.append(f"'{t}' (len {len(t)} @ pos {pos})")
                     
                     if msgs:
-                        tgt_msg = " | ".join(msgs)
+                        tgt_msg = " & ".join(msgs)
                         print(f"  [{idx}] [OK] Randomizing Targets: {tgt_msg}")
-                        print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto'} | Country Options: {pair['country'] or 'Auto'}")
+                        print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto (Cycle Default)'} | Country Options: {pair['country'] or 'Auto (Cycle Default)'}")
                 else:
                     print(f"  [{idx}] [OK] No random target specified.")
-                    print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto'} | Country Options: {pair['country'] or 'Auto'}")
+                    print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto (Cycle Default)'} | Country Options: {pair['country'] or 'Auto (Cycle Default)'}")
 
     inc_display = ", ".join(sorted(list(INC_COUNTRIES))) if INC_COUNTRIES else "None (ALL allowed)"
     exc_display = ", ".join(sorted(list(EXC_COUNTRIES))) if EXC_COUNTRIES else "None"
@@ -1438,9 +1444,6 @@ def main():
     print(f"Follow Redirects        : {FOLLOW_REDIRECT}")
     print(f"Total Active Keys       : {len(pool.active_keys)}")
     print(f"Parallel Bots Enabled   : {PARALLELBOT}")
-    print(f"Browser Rendering       : {BROWSER_RENDERING}")
-    print(f"Residential Proxies     : {RESIDENTIAL}")
-    print(f"Est. Credits Per Hit    : ~{calculate_credits(BROWSER_RENDERING, RESIDENTIAL)} credits")
     print(f"Active Device Hierarchy : {DEVICE_TREE}")
     print(f"Native Browser Weight   : {int(NATIVE_RATIO * 100)}% Native / {int((1.0 - NATIVE_RATIO) * 100)}% Others")
     print(f"Post-Response Cooldown  : {POST_WAIT_MIN:.1f}s - {POST_WAIT_MAX:.1f}s")
@@ -1448,6 +1451,14 @@ def main():
     print(f"Cycle Interval Range    : {CYCLE_MIN:.1f}s - {CYCLE_MAX:.1f}s")
     print(f"Cycle Gap Duration      : {CYCLE_GAP}s")
     print(f"Dynamic IP Language     : {MATCH_IP_LANGUAGE}")
+    
+    print("---------------- SCRAPERAPI COST AUDIT -----------")
+    print(f"Residential Proxies     : {'ENABLED (premium=true)' if RESIDENTIAL else 'DISABLED'}")
+    print(f"Browser Rendering       : {'ENABLED (render=true)' if BROWSER_RENDERING else 'DISABLED'}")
+    print(f"Est. Target Cost        : {calculate_credits(BROWSER_RENDERING, RESIDENTIAL)} credits per request")
+    print("NOTE: If the bot logs output '[API DOWNGRADE]' despite Residential/Render being ENABLED,")
+    print("      it means your ScraperAPI plan restricts these premium features for the requested")
+    print("      country and silently fell back to a 1-credit standard proxy to process the request.")
     print("==================================================\n")
 
     cycle_num = 1
