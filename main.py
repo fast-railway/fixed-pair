@@ -983,6 +983,9 @@ def pick_datacenter_country(used_countries_in_cycle: set):
 
 def resolve_specific_country(cty_str: str) -> tuple:
     cty_str = cty_str.upper().strip()
+    if cty_str == "UK":
+        cty_str = "GB"  # Auto-correct common mistake
+        
     if cty_str in DATACENTER_CODE_TO_NAME:
         return f"OVR-{cty_str}", cty_str, cty_str.lower()
     
@@ -1225,12 +1228,12 @@ CYCLE_GAP = parse_num("CYCLE_GAP", default=0.0)
 
 FOLLOW_REDIRECT = parse_bool("FOLLOW_REDIRECT", default=False)
 MATCH_IP_LANGUAGE = parse_bool("LANGUAGE_ACCORDING_TO_IP", default=False)
+
 WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 1.0, 4.0)
 GAP_MIN, GAP_MAX = parse_range("WORKER_GAP_RANGE", 8.0, 12.0)
 CYCLE_MIN, CYCLE_MAX = parse_range("CYCLE_INTERVAL_RANGE", 50.0, 70.0)
 POST_WAIT_MIN, POST_WAIT_MAX = parse_range("POST_RESPONSE_WAIT_RANGE", 5.0, 15.0)
 
-# Default to False for Render, Default to True for Residential
 BROWSER_RENDERING = parse_bool("BROWSER_RENDERING", default=False)
 RESIDENTIAL = parse_bool("RESIDENTIAL", default=True)
 
@@ -1280,25 +1283,28 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
 
     params = {
         "api_key": key_obj.token,
+        "url": target_url,
         "device_type": selected_cat,
         "keep_headers": "true",
         "session_number": str(rotation_seed),
-        "follow_redirect": "true" if FOLLOW_REDIRECT else "false",
-        "retry": "false",
-        "url": target_url
+        "retry": "false"
     }
     
-    # Strictly bind Premium and Render attributes to URL if global toggles are True
+    if FOLLOW_REDIRECT:
+        params["follow_redirect"] = "true"
+    else:
+        params["follow_redirect"] = "false"
+        
+    # Unconditionally inject rendering and premium flags if globally active
     if BROWSER_RENDERING:
         params["render"] = "true"
-    if code_upper:
-        params["country_code"] = code_upper.lower()
     if RESIDENTIAL:
         params["premium"] = "true"
+    if code_upper:
+        params["country_code"] = code_upper.lower()
 
     url = f"http://api.scraperapi.com?{urllib.parse.urlencode(params)}"
     
-    # Determine language based on toggle and requested country
     if MATCH_IP_LANGUAGE and code_lower and code_upper:
         dynamic_lang = f"{code_lower}-{code_upper},{code_lower};q=0.9,en-US;q=0.8,en;q=0.5"
     else:
@@ -1326,14 +1332,16 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
 
     req = urllib.request.Request(url, headers=headers)
 
+    # For debugging output, let's format what is actually being sent to ScraperAPI (excluding URL/API key)
+    api_params_debug = "&".join([f"{k}={v}" for k, v in params.items() if k not in ["api_key", "url"]])
+
     try:
         with urllib.request.urlopen(req, timeout=65) as resp:
             actual_credits = resp.headers.get("sa-credit-cost")
             
-            # API Downgrade Detection
             downgrade_warn = ""
             if actual_credits and int(actual_credits) < expected_credits:
-                downgrade_warn = " [API DOWNGRADE: ScraperAPI ignored Premium request!]"
+                downgrade_warn = " [API DOWNGRADE]"
                 
             cost_str = actual_credits if actual_credits else str(expected_credits)
             
@@ -1356,7 +1364,7 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
                 print(
                     f"[Bot-{bot_id}/{total_bots}] [{tier_label}-{country_tag}] [{proxy_type}] [{selected_cat.upper()}:{os_label}] "
                     f"[{ltype} {slug}] [Target: {truncated_target}] [Ref: {ref_display}] "
-                    f"[Credits: {cost_str} cost]{downgrade_warn} [{key_obj.tag}] -> HTTP {resp.status} OK"
+                    f"[Params: {api_params_debug}] [Credits: {cost_str} cost]{downgrade_warn} [{key_obj.tag}] -> HTTP {resp.status} OK"
                 )
 
     except urllib.error.HTTPError as e:
@@ -1449,7 +1457,6 @@ def main():
     print(f"Post-Response Cooldown  : {POST_WAIT_MIN:.1f}s - {POST_WAIT_MAX:.1f}s")
     print(f"Worker Gap Interval     : {GAP_MIN:.1f}s - {GAP_MAX:.1f}s")
     print(f"Cycle Interval Range    : {CYCLE_MIN:.1f}s - {CYCLE_MAX:.1f}s")
-    print(f"Cycle Gap Duration      : {CYCLE_GAP}s")
     print(f"Dynamic IP Language     : {MATCH_IP_LANGUAGE}")
     
     print("---------------- SCRAPERAPI COST AUDIT -----------")
