@@ -500,12 +500,14 @@ def tokenize_balanced_blocks(s: str) -> list:
 def extract_url_and_blocks(token: str) -> tuple:
     url_end = token.find('{')
     if url_end == -1:
-        return token.strip(), []
+        return token.strip(), [], False
     
     url = token[:url_end].strip()
     blocks = []
     depth = 0
     buf = []
+    syntax_error = False
+    
     for ch in token[url_end:]:
         if ch == '{':
             if depth > 0: buf.append(ch)
@@ -514,14 +516,19 @@ def extract_url_and_blocks(token: str) -> tuple:
             depth -= 1
             if depth > 0: 
                 buf.append(ch)
-            elif depth <= 0:
+            elif depth == 0:
                 blocks.append("".join(buf).strip())
                 buf = []
-                depth = 0 
+            else:
+                syntax_error = True
         else:
             if depth > 0:
                 buf.append(ch)
-    return url, blocks
+                
+    if depth != 0:
+        syntax_error = True
+        
+    return url, blocks, syntax_error
 
 def parse_nested_device_spec(spec_str: str) -> dict:
     spec_str = spec_str.strip()
@@ -598,7 +605,7 @@ PAIRED_LINKS_DATA = []
 if RAW_PAIRED_LINKS:
     tokens = tokenize_balanced_blocks(RAW_PAIRED_LINKS)
     for token in tokens:
-        url, blocks = extract_url_and_blocks(token)
+        url, blocks, has_syntax_error = extract_url_and_blocks(token)
         if not url: continue
         
         has_map = len(blocks) > 0
@@ -614,7 +621,8 @@ if RAW_PAIRED_LINKS:
             "random_target": rand_tgt,
             "device": dev_map,
             "country": cty_map,
-            "has_map": has_map
+            "has_map": has_map,
+            "syntax_error": has_syntax_error
         })
 
 
@@ -1122,17 +1130,33 @@ class TaskManager:
             roll = random.random()
             if roll < self.weight_reg and reg_idx < len(reg_batch):
                 url, slug, ltype = reg_batch[reg_idx]
-                # Return standard tuple + None for overrides
                 tasks.append((url, slug, ltype, None, None))
                 reg_idx += 1
             elif self.paired_data:
                 pair = random.choice(self.paired_data)
                 url = pair['url']
-                tgt = pair['random_target']
-                if tgt and tgt in url:
-                    new_str = generate_random_string(len(tgt))
-                    url = url.replace(tgt, new_str)
-                tasks.append((url, "PAIRED", "PAIR-DIR", pair['device'], pair['country']))
+                
+                # Replace ALL targeted strings with random chars of identical length
+                if pair['random_target']:
+                    tgts = tokenize_balanced_blocks(pair['random_target'])
+                    for tgt in tgts:
+                        if tgt and tgt in url:
+                            new_str = generate_random_string(len(tgt))
+                            url = url.replace(tgt, new_str)
+                
+                # Pick ONE random device mapping from the comma-separated options
+                chosen_dev = ""
+                if pair['device']:
+                    devs = tokenize_balanced_blocks(pair['device'])
+                    if devs: chosen_dev = random.choice(devs)
+                
+                # Pick ONE random country mapping from the comma-separated options
+                chosen_cty = ""
+                if pair['country']:
+                    ctys = tokenize_balanced_blocks(pair['country'])
+                    if ctys: chosen_cty = random.choice(ctys)
+                    
+                tasks.append((url, "PAIRED", "PAIR-DIR", chosen_dev, chosen_cty))
             elif reg_idx < len(reg_batch):
                 url, slug, ltype = reg_batch[reg_idx]
                 tasks.append((url, slug, ltype, None, None))
@@ -1206,12 +1230,12 @@ CYCLE_GAP = parse_num("CYCLE_GAP", default=0.0)
 
 FOLLOW_REDIRECT = parse_bool("FOLLOW_REDIRECT", default=False)
 MATCH_IP_LANGUAGE = parse_bool("LANGUAGE_ACCORDING_TO_IP", default=False)
-WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 1, 4)
+WORKER_MIN, WORKER_MAX = parse_range("WORKER_COUNT_RANGE", 1.0, 4.0)
 GAP_MIN, GAP_MAX = parse_range("WORKER_GAP_RANGE", 8.0, 12.0)
 CYCLE_MIN, CYCLE_MAX = parse_range("CYCLE_INTERVAL_RANGE", 50.0, 70.0)
 POST_WAIT_MIN, POST_WAIT_MAX = parse_range("POST_RESPONSE_WAIT_RANGE", 5.0, 15.0)
 
-BROWSER_RENDERING = get_env("BROWSER_RENDERING", "false").lower()
+BROWSER_RENDERING = parse_bool("BROWSER_RENDERING", default=False)
 RESIDENTIAL = parse_bool("RESIDENTIAL", default=True)
 
 DEFAULT_REFERRERS = [
@@ -1236,8 +1260,7 @@ LINK_DISPATCHER = CycleLinkDispatcher(INPUT_LINKS, SHORT_TEMPLATE)
 RATIO_STR = get_env("LINK_PAIR_RATIO", "50,50")
 TASK_ENGINE = TaskManager(LINK_DISPATCHER, PAIRED_LINKS_DATA, RATIO_STR)
 
-def calculate_credits(render_flag: str, is_residential: bool) -> int:
-    is_render = render_flag == "true"
+def calculate_credits(is_render: bool, is_residential: bool) -> int:
     if is_residential and is_render:
         return 25
     elif is_residential or is_render:
@@ -1262,7 +1285,7 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
     params = {
         "api_key": key_obj.token,
         "device_type": selected_cat,
-        "render": BROWSER_RENDERING,
+        "render": "true" if BROWSER_RENDERING else "false",
         "keep_headers": "true",
         "session_number": str(rotation_seed),
         "follow_redirect": "true" if FOLLOW_REDIRECT else "false",
@@ -1271,12 +1294,12 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
     }
     if code_upper:
         params["country_code"] = code_upper.lower()
+    
     if RESIDENTIAL:
         params["premium"] = "true"
 
     url = f"http://api.scraperapi.com?{urllib.parse.urlencode(params)}"
     
-    # Determine language based on toggle and requested country
     if MATCH_IP_LANGUAGE and code_lower and code_upper:
         dynamic_lang = f"{code_lower}-{code_upper},{code_lower};q=0.9,en-US;q=0.8,en;q=0.5"
     else:
@@ -1308,26 +1331,26 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
         with urllib.request.urlopen(req, timeout=65) as resp:
             actual_credits = resp.headers.get("sa-credit-cost", str(expected_credits))
             
-            # Inspect proxy exit headers to detect silent upstream routing to US/NL/FR
             exit_country = (
                 resp.headers.get("sa-proxy-country") 
                 or resp.headers.get("sa-country") 
                 or resp.headers.get("x-scraperapi-country") 
                 or ""
             ).strip().upper()
+            
+            proxy_type = "RES-PREM" if RESIDENTIAL else "DC-STD"
 
-            # Strictly verify exit country if an explicit country was chosen
             if INC_COUNTRIES and code_upper and exit_country and exit_country != code_upper:
                 print(
-                    f"[Bot-{bot_id}/{total_bots}] [GEO REJECTED] [Requested: {code_upper} | ScraperAPI returned: {exit_country}] "
-                    f"Traffic ignored to protect your stats. [Credits: ~{actual_credits}] [{key_obj.tag}]"
+                    f"[Bot-{bot_id}/{total_bots}] [GEO REJECTED] [Requested: {code_upper} | Exit: {exit_country}] "
+                    f"Ignored to protect stats. [Credits: {actual_credits} cost] [{key_obj.tag}]"
                 )
             else:
                 country_tag = exit_country if exit_country else code_upper
                 print(
-                    f"[Bot-{bot_id}/{total_bots}] [{tier_label}-{country_tag}] [{selected_cat.upper()}:{os_label}] "
+                    f"[Bot-{bot_id}/{total_bots}] [{tier_label}-{country_tag}] [{proxy_type}] [{selected_cat.upper()}:{os_label}] "
                     f"[{ltype} {slug}] [Target: {truncated_target}] [Ref: {ref_display}] "
-                    f"[Credits: ~{actual_credits} cost] [{key_obj.tag}] -> HTTP {resp.status} OK"
+                    f"[Credits: {actual_credits} cost] [{key_obj.tag}] -> HTTP {resp.status} OK"
                 )
 
     except urllib.error.HTTPError as e:
@@ -1337,7 +1360,7 @@ def execute_bot(bot_id: int, total_bots: int, target_url: str, slug: str, ltype:
             raw_detail = "Could not read error body"
             
         if e.code in (401, 403):
-            reason_msg = f"HTTP {e.code} - Actual ScraperAPI Error: {raw_detail}"
+            reason_msg = f"HTTP {e.code} - ScraperAPI Error: {raw_detail}"
             pool.mark_dead(key_obj, reason_msg)
         elif e.code == 429:
             print(f"[Bot-{bot_id}] [{key_obj.tag}] [Target: {truncated_target}] [Credits: 0] [TRANSIENT] HTTP 429 Rate limit exceeded")
@@ -1375,18 +1398,31 @@ def main():
     else:
         print(f" Detected {len(PAIRED_LINKS_DATA)} paired link(s).")
         for idx, pair in enumerate(PAIRED_LINKS_DATA, 1):
+            if pair['syntax_error']:
+                print(f"  [{idx}] [SYNTAX MISTAKE] Unmatched brackets '{{}}' detected in map! Fix your URL formatting.")
+                print(f"         Offending URL: {truncate_url(pair['url'])}")
+                
             if not pair['has_map']:
                 print(f"  [{idx}] [WARN] No map found. Defaults applied (Desktop). Missing Map URL: {truncate_url(pair['url'])}")
             else:
-                tgt = pair['random_target']
-                if tgt:
-                    pos = pair['url'].find(tgt)
-                    if pos == -1:
-                        print(f"  [{idx}] [RED ALERT] Target string '{tgt}' NOT FOUND in URL! Replace will fail. URL: {truncate_url(pair['url'])}")
-                    else:
-                        print(f"  [{idx}] [OK] Random Target: '{tgt}' (len {len(tgt)}) at pos {pos}. Device: {pair['device'] or 'Auto'}, Country: {pair['country'] or 'Auto'}")
+                tgt_raw = pair['random_target']
+                if tgt_raw:
+                    tgts = tokenize_balanced_blocks(tgt_raw)
+                    msgs = []
+                    for t in tgts:
+                        pos = pair['url'].find(t)
+                        if pos == -1:
+                            print(f"  [{idx}] [RED ALERT] Target string '{t}' NOT FOUND in URL! Replace will fail.")
+                        else:
+                            msgs.append(f"'{t}' (len {len(t)} @ pos {pos})")
+                    
+                    if msgs:
+                        tgt_msg = " | ".join(msgs)
+                        print(f"  [{idx}] [OK] Randomizing Targets: {tgt_msg}")
+                        print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto'} | Country Options: {pair['country'] or 'Auto'}")
                 else:
-                    print(f"  [{idx}] [OK] No random target specified. Device: {pair['device'] or 'Auto'}, Country: {pair['country'] or 'Auto'}")
+                    print(f"  [{idx}] [OK] No random target specified.")
+                    print(f"  [{idx}] [MAP] Device Options: {pair['device'] or 'Auto'} | Country Options: {pair['country'] or 'Auto'}")
 
     inc_display = ", ".join(sorted(list(INC_COUNTRIES))) if INC_COUNTRIES else "None (ALL allowed)"
     exc_display = ", ".join(sorted(list(EXC_COUNTRIES))) if EXC_COUNTRIES else "None"
@@ -1403,7 +1439,7 @@ def main():
     print(f"Total Active Keys       : {len(pool.active_keys)}")
     print(f"Parallel Bots Enabled   : {PARALLELBOT}")
     print(f"Browser Rendering       : {BROWSER_RENDERING}")
-    print(f"Residential Proxies     : {'ENABLED (premium=true)' if RESIDENTIAL else 'DISABLED (Standard DataCenter Free Credit)'}")
+    print(f"Residential Proxies     : {RESIDENTIAL}")
     print(f"Est. Credits Per Hit    : ~{calculate_credits(BROWSER_RENDERING, RESIDENTIAL)} credits")
     print(f"Active Device Hierarchy : {DEVICE_TREE}")
     print(f"Native Browser Weight   : {int(NATIVE_RATIO * 100)}% Native / {int((1.0 - NATIVE_RATIO) * 100)}% Others")
